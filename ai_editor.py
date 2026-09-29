@@ -1,66 +1,318 @@
+# Load environment variables from the local .env file.
+from dotenv import load_dotenv
+
 # Import os to read environment variables.
 import os
 
-# Import BytesIO to convert image bytes into a file-like object.
+# Import BytesIO to work with image data in memory.
 from io import BytesIO
 
-# Import load_dotenv to load the API key from the .env file.
-from dotenv import load_dotenv
-
-# Import the Gemini API client.
-from google import genai
-
-# Import PIL Image to work with image files.
+# Import PIL Image to process images.
 from PIL import Image
 
+# Import the Google Gemini SDK.
+from google import genai
 
-# Load the variables stored in the .env file.
+# Import Gemini data types for image input.
+from google.genai import types
+
+# Import LangChain's Gemini integration.
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Import LangChain prompt template.
+from langchain_core.prompts import PromptTemplate
+
+
+# Load variables from the .env file.
 load_dotenv()
 
 
-# Read the Gemini API key from the environment.
-api_key = os.getenv("GEMINI_API_KEY")
+# Read the Gemini API key.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Read the LangChain text model.
+LANGCHAIN_TEXT_MODEL = os.getenv(
+    "LANGCHAIN_TEXT_MODEL",
+    "gemini-2.5-flash"
+)
+
+# Read the Gemini image model.
+GEMINI_IMAGE_MODEL = os.getenv(
+    "GEMINI_IMAGE_MODEL",
+    "gemini-3.1-flash-image"
+)
 
 
-# Create the Gemini API client using the API key.
-client = genai.Client(api_key=api_key)
+# Create the Gemini client only when an API key exists.
+client = None
 
-
-# Define a function that receives an image and an editing instruction.
-def edit_image(image, prompt):
-
-    # Send the editing instruction and image to the Gemini image model.
-    response = client.models.generate_content(
-
-        # Specify the Gemini image editing model.
-        model="gemini-3.1-flash-image",
-
-        # Provide the user's instruction and the input image.
-        contents=[
-            prompt,
-            image
-        ]
+if GEMINI_API_KEY:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
     )
 
-    # Check every part of Gemini's response.
-    for part in response.parts:
 
-        # Check whether Gemini returned image data.
-        if part.inline_data is not None:
+def get_user_friendly_error(error):
+    """
+    Convert technical API errors into simple messages.
+    """
 
-            # Get the raw image bytes returned by Gemini.
-            image_bytes = part.inline_data.data
+    # Convert the exception into lowercase text.
+    error_text = str(error).lower()
 
-            # Convert the raw bytes into a PIL image.
-            edited_image = Image.open(
-                BytesIO(image_bytes)
-            ).copy()
+    # Handle quota and spending-limit errors.
+    if (
+        "429" in error_text
+        or "resource_exhausted" in error_text
+        or "quota" in error_text
+        or "spending cap" in error_text
+    ):
+        return (
+            "The AI service has reached its usage limit. "
+            "Please try again later."
+        )
 
-            # Explicitly set the image format to PNG.
-            edited_image.format = "PNG"
+    # Handle authentication and API key errors.
+    if (
+        "401" in error_text
+        or "403" in error_text
+        or "unauthorized" in error_text
+        or "permission denied" in error_text
+        or "api key" in error_text
+    ):
+        return (
+            "There is a problem with the AI service configuration. "
+            "Please check the API key."
+        )
 
-            # Return the properly formatted PIL image.
-            return edited_image
+    # Handle invalid request errors.
+    if (
+        "400" in error_text
+        or "invalid argument" in error_text
+    ):
+        return (
+            "The AI could not process this request. "
+            "Please try a clearer editing instruction."
+        )
 
-    # Return None if Gemini did not return an image.
-    return None
+    # Handle connection and network errors.
+    if (
+        "connection" in error_text
+        or "timeout" in error_text
+        or "network" in error_text
+        or "dns" in error_text
+    ):
+        return (
+            "Unable to connect to the AI service. "
+            "Please try again."
+        )
+
+    # Generic fallback message.
+    return (
+        "Something went wrong while processing the image. "
+        "Please try again."
+    )
+
+
+def refine_prompt(user_prompt):
+    """
+    Use LangChain + Gemini to improve the user's
+    image-editing instruction.
+    """
+
+    # Create a reusable LangChain prompt template.
+    prompt_template = PromptTemplate.from_template(
+        """
+You are an AI image-editing prompt assistant.
+
+Convert the user's image-editing instruction into a
+clear and specific instruction for an image-editing model.
+
+Keep the user's original intention.
+Do not add unnecessary changes.
+Do not mention that you are rewriting the prompt.
+
+User instruction:
+{user_prompt}
+
+Return only the improved image-editing instruction.
+"""
+    )
+
+    # Create the Gemini language model through LangChain.
+    llm = ChatGoogleGenerativeAI(
+        model=LANGCHAIN_TEXT_MODEL,
+        google_api_key=GEMINI_API_KEY,
+        temperature=0.2
+    )
+
+    # Create an actual LangChain pipeline.
+    prompt_chain = prompt_template | llm
+
+    # Execute the LangChain pipeline.
+    response = prompt_chain.invoke(
+        {
+            "user_prompt": user_prompt
+        }
+    )
+
+    # Get the text generated by the language model.
+    refined_prompt = response.content
+
+    # Handle structured content if returned by the model.
+    if isinstance(refined_prompt, list):
+
+        # Extract text values from structured response content.
+        refined_prompt = " ".join(
+            item.get("text", "")
+            for item in refined_prompt
+            if isinstance(item, dict)
+        )
+
+    # Convert the result into a clean string.
+    refined_prompt = str(
+        refined_prompt
+    ).strip()
+
+    # Make sure the model returned something useful.
+    if not refined_prompt:
+        raise ValueError(
+            "The AI could not understand the editing instruction. "
+            "Please try again."
+        )
+
+    # Return the improved prompt.
+    return refined_prompt
+
+
+def edit_image(image, user_prompt):
+    """
+    Complete AI image-editing pipeline.
+
+    User Prompt
+        ↓
+    LangChain + Gemini Text Model
+        ↓
+    Refined Prompt
+        ↓
+    Gemini Image Model
+        ↓
+    Edited Image
+    """
+
+    # Check whether the Gemini API key is available.
+    if not GEMINI_API_KEY:
+        raise ValueError(
+            "AI service is not configured. "
+            "Please add the Gemini API key."
+        )
+
+    # Check whether the Gemini client exists.
+    if client is None:
+        raise ValueError(
+            "AI service is not available. "
+            "Please check the API configuration."
+        )
+
+    # Check whether the user entered a prompt.
+    if not user_prompt or not user_prompt.strip():
+        raise ValueError(
+            "Please describe what you want to change in the image."
+        )
+
+    # Limit the prompt length.
+    if len(user_prompt) > 500:
+        raise ValueError(
+            "Please keep the editing instruction under 500 characters."
+        )
+
+    try:
+
+        # ---------------------------------------------------------
+        # STEP 1: Refine the user prompt using LangChain.
+        # ---------------------------------------------------------
+
+        refined_prompt = refine_prompt(
+            user_prompt.strip()
+        )
+
+        # ---------------------------------------------------------
+        # STEP 2: Convert the uploaded image into PNG bytes.
+        # ---------------------------------------------------------
+
+        image_buffer = BytesIO()
+
+        # Convert the image to RGB and save it in memory.
+        image.convert("RGB").save(
+            image_buffer,
+            format="PNG"
+        )
+
+        # Get the image bytes.
+        image_bytes = image_buffer.getvalue()
+
+        # ---------------------------------------------------------
+        # STEP 3: Create a Gemini image input part.
+        # ---------------------------------------------------------
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/png"
+        )
+
+        # ---------------------------------------------------------
+        # STEP 4: Send prompt + image to Gemini image model.
+        # ---------------------------------------------------------
+
+        response = client.models.generate_content(
+            model=GEMINI_IMAGE_MODEL,
+            contents=[
+                refined_prompt,
+                image_part
+            ]
+        )
+
+        # ---------------------------------------------------------
+        # STEP 5: Extract the generated image.
+        # ---------------------------------------------------------
+
+        for part in response.parts:
+
+            # Check whether this response part contains image data.
+            if part.inline_data is not None:
+
+                # Get the raw image bytes returned by Gemini.
+                generated_image_bytes = part.inline_data.data
+
+                # Convert the generated bytes into a standard PIL Image.
+                edited_image = Image.open(
+                    BytesIO(generated_image_bytes)
+                ).convert("RGB")
+
+                # Return the PIL image to Streamlit.
+                return edited_image
+
+        # Gemini did not return an image.
+        raise RuntimeError(
+            "The AI did not return an edited image. "
+            "Please try a different editing instruction."
+        )
+
+    except ValueError:
+        # Keep our own validation messages unchanged.
+        raise
+
+    except RuntimeError:
+        # Keep our own image-generation message unchanged.
+        raise
+
+    except Exception as error:
+        # Convert technical errors into a simple user message.
+        friendly_message = get_user_friendly_error(
+            error
+        )
+
+        # Raise only the friendly message.
+        raise RuntimeError(
+            friendly_message
+        )
